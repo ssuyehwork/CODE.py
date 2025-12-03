@@ -1,535 +1,1519 @@
-import tkinter as tk
-from tkinter import ttk, filedialog, scrolledtext, messagebox
-import google.generativeai as genai
-import json
-import os
+# J 监听剪贴板功能主界面.py
+# -*- coding: utf-8 -*-
 import sys
-import subprocess
-import threading
-from pathlib import Path
-from io import StringIO
+import os
+import hashlib
+from datetime import datetime
 
-class AICodeEditor:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("AI代码编辑器")
-        self.root.geometry("1600x900")
-        
-        # 配置Gemini API
-        self.api_key = "AIzaSyB3QcTs7oN_fKGEQaKc0WBxEpT7OEG_eHs"
-        genai.configure(api_key=self.api_key)
-        self.model = genai.GenerativeModel('gemini-pro')
-        
-        # 数据存储
-        self.config_file = "editor_config.json"
-        self.file_list = []
-        self.file_contents = {}
-        self.current_file = None
-        self.main_program = None  # 主程序入口
-        self.chat_history = []
-        self.running_process = None  # 当前运行的进程
-        
-        # 加载配置
-        self.load_config()
-        
-        # 创建UI
-        self.create_ui()
-        
-        # 加载已保存的文件
-        self.load_saved_files()
+# === 1. 数据库部分 (保持不变) ===
+from sqlalchemy import create_engine, Column, Integer, String, Text, Boolean, DateTime, ForeignKey, Table, Index, Float, func
+from sqlalchemy.orm import declarative_base, relationship, sessionmaker, joinedload
+
+try:
+    from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+                                 QHBoxLayout, QPushButton, QLabel, QLineEdit, 
+                                 QTableWidget, QTableWidgetItem, QHeaderView, 
+                                 QComboBox, QAbstractItemView, QShortcut, QInputDialog, 
+                                 QMessageBox, QTextEdit, QMenu, QFrame, QScrollArea, 
+                                 QDockWidget, QSizePolicy, QSplitter, QDialog, QGridLayout, 
+                                 QListWidget, QListWidgetItem, QCheckBox, QSpinBox)
+    from PyQt5.QtGui import QKeySequence, QColor, QFont, QIcon, QCursor
+    from PyQt5.QtCore import Qt, pyqtSlot, QSize, QSettings
+except ImportError:
+    print("请安装库: pip install PyQt5 SQLAlchemy")
+    sys.exit(1)
+
+Base = declarative_base()
+
+# 关联表
+item_tags = Table(
+    'item_tags', Base.metadata,
+    Column('item_id', Integer, ForeignKey('clipboard_items.id'), primary_key=True),
+    Column('tag_id', Integer, ForeignKey('tags.id'), primary_key=True),
+    Index('idx_tag_item', 'tag_id', 'item_id')
+)
+
+class ClipboardItem(Base):
+    __tablename__ = 'clipboard_items'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    content = Column(Text, nullable=False)
+    content_hash = Column(String(64), index=True, unique=True)
+    note = Column(Text, default="")
+    created_at = Column(DateTime, default=datetime.now)
+    last_visited_at = Column(DateTime, default=datetime.now)
+    visit_count = Column(Integer, default=0)
+    sort_index = Column(Float, default=0.0)
+    star_level = Column(Integer, default=0) 
+    is_favorite = Column(Boolean, default=False)
+    is_locked = Column(Boolean, default=False)
+    is_pinned = Column(Boolean, default=False)
+    group_color = Column(String(20), default=None)  # 分组颜色
+    custom_color = Column(String(20), default=None)  # 自定义颜色标签
+    is_file = Column(Boolean, default=False)  # 是否为文件
+    file_path = Column(Text, default=None)  # 文件路径
+    tags = relationship("Tag", secondary=item_tags, back_populates="items")
+
+class Tag(Base):
+    __tablename__ = 'tags'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(50), unique=True, nullable=False)
+    items = relationship("ClipboardItem", secondary=item_tags, back_populates="tags")
+
+class DBManager:
+    def __init__(self, db_path='sqlite:///clipboard_data.db'):
+        if os.path.dirname(sys.argv[0]): os.chdir(os.path.dirname(sys.argv[0]))
+        self.engine = create_engine(db_path + "?check_same_thread=False", echo=False)
+        Base.metadata.create_all(self.engine)
+        self.Session = sessionmaker(bind=self.engine)
+        self._migrate_database()  # 执行数据库迁移
     
-    def create_ui(self):
-        # 主容器
-        main_container = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
-        main_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+    def _migrate_database(self):
+        """数据库迁移:添加新字段"""
+        import sqlite3
+        db_file = 'clipboard_data.db'
         
-        # 左侧面板 - 文件列表
-        left_frame = ttk.Frame(main_container, width=250)
-        main_container.add(left_frame, weight=1)
-        
-        # 文件列表标题和按钮
-        file_header = ttk.Frame(left_frame)
-        file_header.pack(fill=tk.X, padx=5, pady=5)
-        
-        ttk.Label(file_header, text="项目文件", font=("Arial", 12, "bold")).pack(side=tk.LEFT)
-        
-        btn_frame = ttk.Frame(file_header)
-        btn_frame.pack(side=tk.RIGHT)
-        
-        ttk.Button(btn_frame, text="➕", width=3, command=self.add_file).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="📁", width=3, command=self.add_folder).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="🗑", width=3, command=self.remove_file).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="🔄", width=3, command=self.reload_all).pack(side=tk.LEFT, padx=2)
-        
-        # 文件列表
-        list_frame = ttk.Frame(left_frame)
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        scrollbar = ttk.Scrollbar(list_frame)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        self.file_listbox = tk.Listbox(list_frame, yscrollcommand=scrollbar.set, font=("Consolas", 10))
-        self.file_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.file_listbox.bind('<<ListboxSelect>>', self.on_file_select)
-        self.file_listbox.bind('<Button-3>', self.show_file_context_menu)  # 右键菜单
-        
-        scrollbar.config(command=self.file_listbox.yview)
-        
-        # 创建右键菜单
-        self.file_context_menu = tk.Menu(self.root, tearoff=0)
-        self.file_context_menu.add_command(label="设为主程序", command=self.set_as_main)
-        self.file_context_menu.add_command(label="运行此文件", command=self.run_selected_file)
-        
-        # 主程序标签
-        self.main_program_label = ttk.Label(left_frame, text="主程序: 未设置", 
-                                           font=("Arial", 9), foreground="blue")
-        self.main_program_label.pack(fill=tk.X, padx=5, pady=5)
-        
-        # 右侧面板容器
-        right_container = ttk.PanedWindow(main_container, orient=tk.VERTICAL)
-        main_container.add(right_container, weight=4)
-        
-        # 代码编辑区
-        code_frame = ttk.LabelFrame(right_container, text="代码编辑区", padding=10)
-        right_container.add(code_frame, weight=2)
-        
-        self.code_text = scrolledtext.ScrolledText(code_frame, wrap=tk.NONE, 
-                                                    font=("Consolas", 11),
-                                                    bg="#1e1e1e", fg="#d4d4d4",
-                                                    insertbackground="white")
-        self.code_text.pack(fill=tk.BOTH, expand=True)
-        
-        # 代码操作按钮
-        code_btn_frame = ttk.Frame(code_frame)
-        code_btn_frame.pack(fill=tk.X, pady=(5, 0))
-        
-        ttk.Button(code_btn_frame, text="💾 保存", command=self.save_current_file).pack(side=tk.LEFT, padx=5)
-        ttk.Button(code_btn_frame, text="↩ 撤销更改", command=self.revert_changes).pack(side=tk.LEFT, padx=5)
-        
-        # 运行控制区
-        run_frame = ttk.LabelFrame(code_btn_frame, text="运行控制", padding=5)
-        run_frame.pack(side=tk.LEFT, padx=20)
-        
-        self.run_btn = ttk.Button(run_frame, text="▶ 运行主程序", 
-                                  command=self.run_main_program, style="Accent.TButton")
-        self.run_btn.pack(side=tk.LEFT, padx=5)
-        
-        self.stop_btn = ttk.Button(run_frame, text="⏹ 停止", 
-                                   command=self.stop_program, state=tk.DISABLED)
-        self.stop_btn.pack(side=tk.LEFT, padx=5)
-        
-        ttk.Button(run_frame, text="🗑 清空输出", 
-                  command=self.clear_console).pack(side=tk.LEFT, padx=5)
-        
-        # 输出控制台
-        console_frame = ttk.LabelFrame(right_container, text="输出控制台", padding=10)
-        right_container.add(console_frame, weight=1)
-        
-        self.console_text = scrolledtext.ScrolledText(console_frame, wrap=tk.WORD, 
-                                                      font=("Consolas", 10),
-                                                      bg="#0c0c0c", fg="#00ff00",
-                                                      insertbackground="white")
-        self.console_text.pack(fill=tk.BOTH, expand=True)
-        
-        # 配置输出样式
-        self.console_text.tag_config("error", foreground="#ff5555")
-        self.console_text.tag_config("info", foreground="#50fa7b")
-        self.console_text.tag_config("warning", foreground="#ffb86c")
-        
-        # AI对话区
-        chat_frame = ttk.LabelFrame(right_container, text="AI助手", padding=10)
-        right_container.add(chat_frame, weight=2)
-        
-        # 对话历史
-        self.chat_display = scrolledtext.ScrolledText(chat_frame, wrap=tk.WORD, 
-                                                       font=("Arial", 10),
-                                                       bg="#f5f5f5", state=tk.DISABLED)
-        self.chat_display.pack(fill=tk.BOTH, expand=True)
-        
-        # 输入区
-        input_frame = ttk.Frame(chat_frame)
-        input_frame.pack(fill=tk.X, pady=(10, 0))
-        
-        self.chat_input = scrolledtext.ScrolledText(input_frame, wrap=tk.WORD, 
-                                                     font=("Arial", 10), height=3)
-        self.chat_input.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
-        
-        btn_container = ttk.Frame(input_frame)
-        btn_container.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        ttk.Button(btn_container, text="发送\n(Ctrl+Enter)", 
-                  command=self.send_to_ai).pack(fill=tk.BOTH, expand=True, pady=(0, 5))
-        ttk.Button(btn_container, text="分析所有\n文件", 
-                  command=self.analyze_all_files).pack(fill=tk.BOTH, expand=True)
-        
-        # 绑定快捷键
-        self.chat_input.bind('<Control-Return>', lambda e: self.send_to_ai())
-        self.root.bind('<F5>', lambda e: self.run_main_program())
-    
-    def load_config(self):
-        """加载配置文件"""
-        if os.path.exists(self.config_file):
-            try:
-                with open(self.config_file, 'r', encoding='utf-8') as f:
-                    config = json.load(f)
-                    self.file_list = config.get('files', [])
-                    self.main_program = config.get('main_program', None)
-            except Exception as e:
-                print(f"加载配置失败: {e}")
-    
-    def save_config(self):
-        """保存配置文件"""
         try:
-            with open(self.config_file, 'w', encoding='utf-8') as f:
-                json.dump({
-                    'files': self.file_list,
-                    'main_program': self.main_program
-                }, f, ensure_ascii=False, indent=2)
-            self.update_main_program_label()
+            conn = sqlite3.connect(db_file)
+            cursor = conn.cursor()
+            
+            # 检查group_color列是否存在
+            cursor.execute("PRAGMA table_info(clipboard_items)")
+            columns = [row[1] for row in cursor.fetchall()]
+            
+            if 'group_color' not in columns:
+                cursor.execute("ALTER TABLE clipboard_items ADD COLUMN group_color VARCHAR(20)")
+                conn.commit()
+                print("✓ 数据库已更新:添加group_color字段")
+            
+            conn.close()
         except Exception as e:
-            messagebox.showerror("错误", f"保存配置失败: {e}")
-    
-    def add_file(self):
-        """添加单个文件"""
-        files = filedialog.askopenfilenames(
-            title="选择文件",
-            filetypes=[("Python文件", "*.py"), ("文本文件", "*.txt"), 
-                      ("所有文件", "*.*")]
-        )
-        for file in files:
-            if file not in self.file_list:
-                self.file_list.append(file)
-                self.load_file_content(file)
+            print(f"数据库迁移警告: {e}")
         
-        self.update_file_list()
-        self.save_config()
-    
-    def add_folder(self):
-        """添加文件夹中的所有Python文件"""
-        folder = filedialog.askdirectory(title="选择文件夹")
-        if folder:
-            for root, dirs, files in os.walk(folder):
-                for file in files:
-                    if file.endswith('.py'):
-                        full_path = os.path.join(root, file)
-                        if full_path not in self.file_list:
-                            self.file_list.append(full_path)
-                            self.load_file_content(full_path)
-            
-            self.update_file_list()
-            self.save_config()
-            messagebox.showinfo("成功", f"已添加文件夹: {folder}")
-    
-    def remove_file(self):
-        """移除选中的文件"""
-        selection = self.file_listbox.curselection()
-        if selection:
-            idx = selection[0]
-            file_path = self.file_list[idx]
-            
-            # 如果删除的是主程序,清除主程序设置
-            if file_path == self.main_program:
-                self.main_program = None
-            
-            self.file_list.pop(idx)
-            if file_path in self.file_contents:
-                del self.file_contents[file_path]
-            
-            self.update_file_list()
-            self.save_config()
-            self.code_text.delete(1.0, tk.END)
-            self.current_file = None
-    
-    def load_file_content(self, file_path):
-        """加载文件内容"""
+        # 添加新字段
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                self.file_contents[file_path] = f.read()
+            conn = sqlite3.connect(db_file)
+            cursor = conn.cursor()
+            
+            cursor.execute("PRAGMA table_info(clipboard_items)")
+            columns = [row[1] for row in cursor.fetchall()]
+            
+            if 'custom_color' not in columns:
+                cursor.execute("ALTER TABLE clipboard_items ADD COLUMN custom_color VARCHAR(20)")
+                print("✓ 数据库已更新:添加custom_color字段")
+            
+            if 'is_file' not in columns:
+                cursor.execute("ALTER TABLE clipboard_items ADD COLUMN is_file BOOLEAN DEFAULT 0")
+                print("✓ 数据库已更新:添加is_file字段")
+            
+            if 'file_path' not in columns:
+                cursor.execute("ALTER TABLE clipboard_items ADD COLUMN file_path TEXT")
+                print("✓ 数据库已更新:添加file_path字段")
+            
+            conn.commit()
+            conn.close()
         except Exception as e:
-            messagebox.showerror("错误", f"读取文件失败 {file_path}: {e}")
-    
-    def load_saved_files(self):
-        """加载所有已保存的文件"""
-        for file_path in self.file_list[:]:
-            if os.path.exists(file_path):
-                self.load_file_content(file_path)
+            print(f"数据库迁移警告: {e}")
+
+    def get_session(self): return self.Session()
+
+    def add_item(self, text, is_file=False, file_path=None):
+        session = self.get_session()
+        try:
+            text_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
+            existing = session.query(ClipboardItem).filter_by(content_hash=text_hash).first()
+            if existing:
+                existing.last_visited_at = datetime.now()
+                existing.visit_count += 1
+                session.commit()
+                return existing, False
+            
+            min_sort = session.query(ClipboardItem).order_by(ClipboardItem.sort_index.asc()).first()
+            new_sort = (min_sort.sort_index - 1.0) if min_sort else 0.0
+            
+            # 自动提取首行到备注
+            auto_note = ""
+            if is_file and file_path:
+                auto_note = os.path.basename(file_path)
             else:
-                self.file_list.remove(file_path)
-        
-        self.update_file_list()
-        self.update_main_program_label()
-        if self.file_list:
-            self.console_print(f"已加载 {len(self.file_list)} 个文件", "info")
-    
-    def reload_all(self):
-        """重新加载所有文件"""
-        for file_path in self.file_list:
-            self.load_file_content(file_path)
-        messagebox.showinfo("成功", "所有文件已重新加载")
-    
-    def update_file_list(self):
-        """更新文件列表显示"""
-        self.file_listbox.delete(0, tk.END)
-        for file_path in self.file_list:
-            display_name = Path(file_path).name
-            if file_path == self.main_program:
-                display_name = "⭐ " + display_name
-            self.file_listbox.insert(tk.END, display_name)
-    
-    def update_main_program_label(self):
-        """更新主程序标签"""
-        if self.main_program:
-            self.main_program_label.config(
-                text=f"主程序: {Path(self.main_program).name}"
+                first_line = text.split('\n')[0].strip()
+                auto_note = first_line[:100] if first_line else ""
+            
+            new_item = ClipboardItem(
+                content=text, 
+                content_hash=text_hash, 
+                sort_index=new_sort,
+                note=auto_note,
+                is_file=is_file,
+                file_path=file_path
             )
-        else:
-            self.main_program_label.config(text="主程序: 未设置")
-    
-    def on_file_select(self, event):
-        """文件选择事件"""
-        selection = self.file_listbox.curselection()
-        if selection:
-            idx = selection[0]
-            file_path = self.file_list[idx]
-            self.current_file = file_path
-            
-            # 显示文件内容
-            self.code_text.delete(1.0, tk.END)
-            if file_path in self.file_contents:
-                self.code_text.insert(1.0, self.file_contents[file_path])
-    
-    def show_file_context_menu(self, event):
-        """显示文件右键菜单"""
-        # 选中右键点击的项
-        idx = self.file_listbox.nearest(event.y)
-        self.file_listbox.selection_clear(0, tk.END)
-        self.file_listbox.selection_set(idx)
-        self.file_listbox.activate(idx)
-        
-        # 显示菜单
-        self.file_context_menu.post(event.x_root, event.y_root)
-    
-    def set_as_main(self):
-        """设置选中文件为主程序"""
-        selection = self.file_listbox.curselection()
-        if selection:
-            idx = selection[0]
-            self.main_program = self.file_list[idx]
-            self.save_config()
-            self.update_file_list()
-            self.console_print(f"已设置主程序: {Path(self.main_program).name}", "info")
-    
-    def run_selected_file(self):
-        """运行选中的文件"""
-        selection = self.file_listbox.curselection()
-        if selection:
-            idx = selection[0]
-            file_path = self.file_list[idx]
-            self.run_python_file(file_path)
-    
-    def save_current_file(self):
-        """保存当前文件"""
-        if not self.current_file:
-            messagebox.showwarning("警告", "请先选择一个文件")
-            return
-        
+            session.add(new_item)
+            session.commit()
+            session.refresh(new_item)
+            return new_item, True
+        except: session.rollback(); return None, False
+        finally: session.close()
+
+    def get_all_items(self, filter_type=None, search_key="", sort_by="manual"):
+        session = self.get_session()
         try:
-            content = self.code_text.get(1.0, tk.END)[:-1]  # 去除最后的换行
-            with open(self.current_file, 'w', encoding='utf-8') as f:
-                f.write(content)
-            self.file_contents[self.current_file] = content
-            self.console_print(f"文件已保存: {Path(self.current_file).name}", "info")
-        except Exception as e:
-            messagebox.showerror("错误", f"保存文件失败: {e}")
-    
-    def revert_changes(self):
-        """撤销更改"""
-        if self.current_file and self.current_file in self.file_contents:
-            self.code_text.delete(1.0, tk.END)
-            self.code_text.insert(1.0, self.file_contents[self.current_file])
-    
-    def console_print(self, message, tag="normal"):
-        """在控制台打印消息"""
-        self.console_text.insert(tk.END, message + "\n", tag)
-        self.console_text.see(tk.END)
-        self.root.update()
-    
-    def clear_console(self):
-        """清空控制台"""
-        self.console_text.delete(1.0, tk.END)
-    
-    def run_main_program(self):
-        """运行主程序"""
-        if not self.main_program:
-            messagebox.showwarning("警告", "请先右键点击文件设置主程序")
-            return
-        
-        if not os.path.exists(self.main_program):
-            messagebox.showerror("错误", "主程序文件不存在")
-            return
-        
-        self.run_python_file(self.main_program)
-    
-    def run_python_file(self, file_path):
-        """在新线程中运行Python文件"""
-        if self.running_process:
-            messagebox.showwarning("警告", "已有程序在运行,请先停止")
-            return
-        
-        self.console_print("="*60, "info")
-        self.console_print(f"▶ 运行: {Path(file_path).name}", "info")
-        self.console_print("="*60, "info")
-        
-        # 禁用运行按钮,启用停止按钮
-        self.run_btn.config(state=tk.DISABLED)
-        self.stop_btn.config(state=tk.NORMAL)
-        
-        # 在新线程中运行
-        thread = threading.Thread(target=self._run_process, args=(file_path,))
-        thread.daemon = True
-        thread.start()
-    
-    def _run_process(self, file_path):
-        """实际执行Python进程"""
+            query = session.query(ClipboardItem).options(joinedload(ClipboardItem.tags))
+            if filter_type == "favorite": query = query.filter(ClipboardItem.is_favorite == True)
+            elif filter_type == "locked": query = query.filter(ClipboardItem.is_locked == True)
+            if search_key:
+                query = query.filter(ClipboardItem.content.like(f"%{search_key}%") | ClipboardItem.note.like(f"%{search_key}%"))
+            
+            # 排序逻辑
+            if sort_by == "manual": query = query.order_by(ClipboardItem.is_pinned.desc(), ClipboardItem.sort_index.asc())
+            elif sort_by == "time_desc": query = query.order_by(ClipboardItem.is_pinned.desc(), ClipboardItem.created_at.desc())
+            elif sort_by == "visit_desc": query = query.order_by(ClipboardItem.is_pinned.desc(), ClipboardItem.visit_count.desc())
+            elif sort_by == "stars_desc": query = query.order_by(ClipboardItem.is_pinned.desc(), ClipboardItem.star_level.desc())
+            elif sort_by == "size_desc": 
+                from sqlalchemy import func
+                query = query.order_by(ClipboardItem.is_pinned.desc(), func.length(ClipboardItem.content).desc())
+            return query.limit(200).all()
+        finally: session.close()
+
+    def get_tag_cloud(self):
+        """核心新增：获取标签云数据 (标签名, 引用计数)"""
+        session = self.get_session()
         try:
-            # 获取文件所在目录
-            work_dir = os.path.dirname(file_path)
-            
-            # 创建子进程
-            self.running_process = subprocess.Popen(
-                [sys.executable, file_path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                cwd=work_dir,
-                bufsize=1,
-                universal_newlines=True
-            )
-            
-            # 读取输出
-            for line in self.running_process.stdout:
-                self.console_print(line.rstrip(), "normal")
-            
-            # 等待进程结束
-            self.running_process.wait()
-            
-            # 读取错误输出
-            stderr = self.running_process.stderr.read()
-            if stderr:
-                self.console_print(stderr, "error")
-            
-            # 显示退出码
-            exit_code = self.running_process.returncode
-            if exit_code == 0:
-                self.console_print(f"\n✓ 程序执行完成 (退出码: {exit_code})", "info")
-            else:
-                self.console_print(f"\n✗ 程序异常退出 (退出码: {exit_code})", "error")
-        
-        except Exception as e:
-            self.console_print(f"\n✗ 运行出错: {e}", "error")
-        
+            # SQL: SELECT name, count(item_id) FROM tags JOIN item_tags GROUP BY tags.id ORDER BY count DESC
+            results = session.query(Tag.name, func.count(item_tags.c.item_id).label('count'))\
+                .join(item_tags)\
+                .group_by(Tag.id)\
+                .order_by(func.count(item_tags.c.item_id).desc())\
+                .all()
+            return results # List of (name, count)
         finally:
-            self.running_process = None
-            # 恢复按钮状态
-            self.root.after(0, self._restore_run_buttons)
-    
-    def _restore_run_buttons(self):
-        """恢复运行按钮状态"""
-        self.run_btn.config(state=tk.NORMAL)
-        self.stop_btn.config(state=tk.DISABLED)
-    
-    def stop_program(self):
-        """停止正在运行的程序"""
-        if self.running_process:
-            try:
-                self.running_process.terminate()
-                self.running_process.wait(timeout=3)
-                self.console_print("\n⏹ 程序已停止", "warning")
-            except:
-                self.running_process.kill()
-                self.console_print("\n⏹ 程序已强制终止", "warning")
-            finally:
-                self.running_process = None
-                self._restore_run_buttons()
-    
-    def add_chat_message(self, role, message):
-        """添加聊天消息"""
-        self.chat_display.config(state=tk.NORMAL)
-        self.chat_display.insert(tk.END, f"\n{'='*60}\n")
-        self.chat_display.insert(tk.END, f"{role}:\n", "role")
-        self.chat_display.insert(tk.END, f"{message}\n")
-        self.chat_display.config(state=tk.DISABLED)
-        self.chat_display.see(tk.END)
-    
-    def send_to_ai(self):
-        """发送消息到AI"""
-        user_message = self.chat_input.get(1.0, tk.END).strip()
-        if not user_message:
-            return
-        
-        self.chat_input.delete(1.0, tk.END)
-        self.add_chat_message("你", user_message)
-        
-        # 构建上下文
-        context = self.build_context(user_message)
-        
+            session.close()
+
+    def update_sort_order(self, ids):
+        session = self.get_session()
         try:
-            response = self.model.generate_content(context)
-            ai_response = response.text
-            self.add_chat_message("AI", ai_response)
+            for idx, item_id in enumerate(ids):
+                item = session.query(ClipboardItem).get(item_id)
+                if item: item.sort_index = float(idx)
+            session.commit()
+        finally: session.close()
+
+    def update_field(self, item_id, field, value):
+        session = self.get_session()
+        try:
+            item = session.query(ClipboardItem).get(item_id)
+            if item: setattr(item, field, value); session.commit(); return True
+            return False
+        finally: session.close()
+
+    def delete_item(self, item_id):
+        session = self.get_session()
+        try:
+            item = session.query(ClipboardItem).get(item_id)
+            if item:
+                if item.is_locked: return False, "数据被【禁删】保护，请先解锁。"
+                session.delete(item); session.commit(); return True, "已删除"
+            return False, "数据不存在"
+        finally: session.close()
+
+    def remove_tag_from_item(self, item_id, tag_name):
+        session = self.get_session()
+        try:
+            item = session.query(ClipboardItem).get(item_id)
+            tag = session.query(Tag).filter_by(name=tag_name).first()
+            if item and tag and tag in item.tags: item.tags.remove(tag); session.commit()
+        finally: session.close()
             
-            # 如果AI建议修改代码,询问是否应用
-            if "```python" in ai_response and self.current_file:
-                if messagebox.askyesno("应用更改", "AI提供了代码建议,是否应用到当前文件?"):
-                    self.apply_ai_suggestion(ai_response)
-        
-        except Exception as e:
-            self.add_chat_message("错误", f"AI请求失败: {e}")
+    def add_tags_to_items(self, item_ids, tag_name):
+        session = self.get_session()
+        try:
+            tag = session.query(Tag).filter_by(name=tag_name).first()
+            if not tag: tag = Tag(name=tag_name); session.add(tag)
+            items = session.query(ClipboardItem).filter(ClipboardItem.id.in_(item_ids)).all()
+            for item in items:
+                if tag not in item.tags: item.tags.append(tag)
+            session.commit()
+        except: session.rollback()
+        finally: session.close()
     
-    def build_context(self, user_message):
-        """构建发送给AI的上下文"""
-        context = f"用户问题: {user_message}\n\n"
+    def auto_delete_old_data(self, days=21):
+        """自动删除21天前的数据(保留锁定的)"""
+        from datetime import timedelta
+        session = self.get_session()
+        try:
+            cutoff_date = datetime.now() - timedelta(days=days)
+            old_items = session.query(ClipboardItem).filter(
+                ClipboardItem.created_at < cutoff_date,
+                ClipboardItem.is_locked == False
+            ).all()
+            count = len(old_items)
+            for item in old_items:
+                session.delete(item)
+            session.commit()
+            return count
+        except:
+            session.rollback()
+            return 0
+        finally:
+            session.close()
+
+# === 2. 可拖拽表格 (已修复闪退和排序问题) ===
+class DraggableTableWidget(QTableWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDragDropMode(QAbstractItemView.InternalMove)
+        self.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)  # 支持多选
+        # 显示插入位置指示器
+        self.setDropIndicatorShown(True)
+
+    def dropEvent(self, event):
+        # 如果不是来自本表格的拖拽，调用父类默认处理
+        if event.source() != self:
+            super().dropEvent(event)
+            return
+
+        # 1. 获取源行和目标位置
+        source_row = self.currentRow()
+        target_index = self.indexAt(event.pos())
+        target_row = target_index.row()
+
+        # 如果拖到了空白处，默认放到最后一行
+        if target_row == -1:
+            target_row = self.rowCount() - 1
+
+        if source_row == target_row:
+            return
+
+        # 2. 手动执行移动操作 (避免使用默认dropEvent导致的崩溃)
+        # 取出源行数据
+        row_items = []
+        for col in range(self.columnCount()):
+            row_items.append(self.takeItem(source_row, col))
+
+        # 移除源行
+        self.removeRow(source_row)
+
+        # 如果源行在目标行上方，移除源行后，目标行索引会前移，需要修正
+        if source_row < target_row:
+            target_row -= 1
         
-        if self.current_file:
-            context += f"当前文件: {Path(self.current_file).name}\n"
-            context += f"文件内容:\n```python\n{self.file_contents.get(self.current_file, '')}\n```\n\n"
+        # 插入新行
+        self.insertRow(target_row)
         
-        context += "请帮我分析或修改代码。如果需要修改代码,请用```python代码块格式提供完整的修改后的代码。"
-        return context
+        # 填回数据
+        for col, item in enumerate(row_items):
+            self.setItem(target_row, col, item)
+
+        # 选中新位置
+        self.selectRow(target_row)
+
+        # 3. 更新界面序号并收集新的ID顺序
+        new_order_ids = []
+        for row in range(self.rowCount()):
+            # 更新显示的序号列 (第0列)
+            item_idx = self.item(row, 0)
+            if item_idx:
+                item_idx.setText(str(row + 1))
+            
+            # 收集隐藏的ID列 (第9列)
+            id_item = self.item(row, 9) 
+            if id_item: 
+                new_order_ids.append(int(id_item.text()))
+        
+        # 4. 通知主窗口更新数据库
+        mw = self.window()
+        if hasattr(mw, 'update_db_order'): 
+            mw.update_db_order(new_order_ids)
+        
+        # 5. 立即刷新数据并选中移动后的行
+        if hasattr(mw, 'load_data'):
+            # 获取移动后的项目id
+            moved_id = new_order_ids[target_row] if target_row < len(new_order_ids) else None
+            mw.load_data(select_id=moved_id)
+
+        event.accept()
+
+# === 3. 现代化标签选择对话框 ===
+class TagSelectorDialog(QDialog):
+    def __init__(self, db_manager, current_item_id, parent=None):
+        super().__init__(parent)
+        self.db = db_manager
+        self.current_item_id = current_item_id
+        self.view_mode = "list"  # list 或 grid
+        self.show_frequent = True
+        self.show_recent = True
+        self.show_recommended = True
+        self.max_display = 50
+        
+        self.setWindowTitle("标签管理")
+        self.setMinimumSize(450, 550)
+        self.setModal(False)  # 非模态对话框
+        
+        # 应用深色主题
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #1e1e2e;
+                color: #cdd6f4;
+            }
+            QLineEdit {
+                background-color: #11111b;
+                border: 1px solid #313244;
+                border-radius: 6px;
+                padding: 8px 12px;
+                color: #cdd6f4;
+                font-size: 13px;
+            }
+            QLineEdit:focus {
+                border: 1px solid #89b4fa;
+            }
+            QListWidget {
+                background-color: #11111b;
+                border: 1px solid #313244;
+                border-radius: 6px;
+                padding: 5px;
+                outline: none;
+            }
+            QListWidget::item {
+                background-color: #181825;
+                border: 1px solid #313244;
+                border-radius: 6px;
+                padding: 8px 12px;
+                margin: 3px;
+                color: #cdd6f4;
+            }
+            QListWidget::item:hover {
+                background-color: #313244;
+                border-color: #89b4fa;
+            }
+            QListWidget::item:selected {
+                background-color: #89b4fa;
+                color: #11111b;
+                border-color: #89b4fa;
+            }
+            QPushButton {
+                background-color: #313244;
+                border: 1px solid #45475a;
+                border-radius: 6px;
+                padding: 8px 16px;
+                color: #cdd6f4;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background-color: #45475a;
+                border-color: #89b4fa;
+            }
+            QPushButton:pressed {
+                background-color: #89b4fa;
+                color: #1e1e2e;
+            }
+            QPushButton#iconBtn {
+                background-color: transparent;
+                border: none;
+                padding: 4px;
+            }
+            QPushButton#iconBtn:hover {
+                background-color: #313244;
+            }
+            QLabel {
+                color: #a6adc8;
+                font-size: 12px;
+            }
+            QLabel#titleLabel {
+                color: #cdd6f4;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QCheckBox {
+                color: #cdd6f4;
+                spacing: 8px;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+                border-radius: 4px;
+                border: 1px solid #313244;
+                background-color: #11111b;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #89b4fa;
+                border-color: #89b4fa;
+            }
+            QCheckBox::indicator:hover {
+                border-color: #89b4fa;
+            }
+        """)
+        
+        self.init_ui()
+        self.load_tags()
     
-    def analyze_all_files(self):
-        """让AI分析所有文件"""
-        if not self.file_list:
-            messagebox.showwarning("警告", "没有文件可分析")
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(12)
+        
+        # 顶部工具栏
+        toolbar = QHBoxLayout()
+        
+        # 搜索框
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("🔍 搜索...")
+        self.search_input.textChanged.connect(self.filter_tags)
+        self.search_input.returnPressed.connect(self.add_tag_from_search)  # 回车添加
+        toolbar.addWidget(self.search_input)
+        
+        # 视图切换按钮
+        btn_list_view = QPushButton("☰")
+        btn_list_view.setObjectName("iconBtn")
+        btn_list_view.setToolTip("列表视图")
+        btn_list_view.clicked.connect(lambda: self.switch_view("list"))
+        toolbar.addWidget(btn_list_view)
+        
+        btn_grid_view = QPushButton("⊞")
+        btn_grid_view.setObjectName("iconBtn")
+        btn_grid_view.setToolTip("网格视图")
+        btn_grid_view.clicked.connect(lambda: self.switch_view("grid"))
+        toolbar.addWidget(btn_grid_view)
+        
+        # 设置按钮
+        btn_settings = QPushButton("⚙")
+        btn_settings.setObjectName("iconBtn")
+        btn_settings.setToolTip("设置")
+        btn_settings.clicked.connect(self.show_settings)
+        toolbar.addWidget(btn_settings)
+        
+        layout.addLayout(toolbar)
+        
+        # 标签列表
+        self.tag_list = QListWidget()
+        self.tag_list.itemDoubleClicked.connect(self.add_tag_from_list)
+        layout.addWidget(self.tag_list)
+        
+        # 底部提示
+        hint_label = QLabel("💡 提示: 双击标签添加 | 回车键快速添加 | ESC关闭")
+        hint_label.setStyleSheet("color: #6c7086; font-size: 11px;")
+        layout.addWidget(hint_label)
+    
+    def load_tags(self):
+        """加载所有标签"""
+        self.tag_list.clear()
+        tags_data = self.db.get_tag_cloud()
+        
+        # 根据设置过滤和排序
+        filtered_tags = []
+        for name, count in tags_data:
+            if len(filtered_tags) >= self.max_display:
+                break
+            filtered_tags.append((name, count))
+        
+        for name, count in filtered_tags:
+            item = QListWidgetItem(f"🏷️ {name}  ({count})")
+            item.setData(Qt.UserRole, name)  # 存储标签名
+            self.tag_list.addItem(item)
+    
+    def filter_tags(self, text):
+        """根据搜索文本过滤标签"""
+        for i in range(self.tag_list.count()):
+            item = self.tag_list.item(i)
+            tag_name = item.data(Qt.UserRole)
+            item.setHidden(text.lower() not in tag_name.lower())
+    
+    def add_tag_from_search(self):
+        """从搜索框添加标签(回车键)"""
+        tag_name = self.search_input.text().strip()
+        if not tag_name:
             return
         
-        self.add_chat_message("系统", "开始分析所有文件...")
+        # 添加标签到当前项目
+        self.db.add_tags_to_items([self.current_item_id], tag_name)
         
-        context = "请分析以下项目中的所有Python文件,给出代码质量评估和改进建议:\n\n"
+        # 清空搜索框
+        self.search_input.clear()
         
-        for file_path in self.file_list:
-            if file_path.endswith('.py'):
-                context += f"文件: {Path(file_path).name}\n"
-                context += f"```python\n{self.file_contents.get(file_path, '')}\n```\n\n"
+        # 刷新列表
+        self.load_tags()
         
-        try:
-            response = self.model.generate_content(context)
-            self.add_chat_message("AI分析", response.text)
-        except Exception as e:
-            self.add_chat_message("错误", f"分析失败: {e}")
+        # 通知父窗口更新
+        if self.parent():
+            self.parent().update_dock_panel()
+            self.parent().refresh_tag_cloud()
     
-    def apply_ai_suggestion(self, ai_response):
-        """应用AI建议的代码"""
-        # 提取代码块
-        import re
-        code_blocks = re.findall(r'```python\n(.*?)```', ai_response, re.DOTALL)
+    def add_tag_from_list(self, item):
+        """从列表添加标签(双击)"""
+        tag_name = item.data(Qt.UserRole)
+        self.db.add_tags_to_items([self.current_item_id], tag_name)
         
-        if code_blocks:
-            self.code_text.delete(1.0, tk.END)
-            self.code_text.insert(1.0, code_blocks[0])
-            self.add_chat_message("系统", "已应用AI建议,请检查后保存")
+        # 通知父窗口更新
+        if self.parent():
+            self.parent().update_dock_panel()
+            self.parent().refresh_tag_cloud()
+    
+    def switch_view(self, mode):
+        """切换视图模式"""
+        self.view_mode = mode
+        # TODO: 实现网格视图
+        if mode == "grid":
+            QMessageBox.information(self, "提示", "网格视图功能开发中...")
+    
+    def show_settings(self):
+        """显示设置面板"""
+        settings_dialog = QDialog(self)
+        settings_dialog.setWindowTitle("标签设置")
+        settings_dialog.setMinimumSize(300, 250)
+        settings_dialog.setStyleSheet(self.styleSheet())
+        
+        layout = QVBoxLayout(settings_dialog)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
+        
+        # 标题
+        title = QLabel("列表")
+        title.setObjectName("titleLabel")
+        layout.addWidget(title)
+        
+        # 选项
+        cb_frequent = QCheckBox("常用标签")
+        cb_frequent.setChecked(self.show_frequent)
+        cb_frequent.stateChanged.connect(lambda s: setattr(self, 'show_frequent', s == 2))
+        layout.addWidget(cb_frequent)
+        
+        cb_recent = QCheckBox("最近使用")
+        cb_recent.setChecked(self.show_recent)
+        cb_recent.stateChanged.connect(lambda s: setattr(self, 'show_recent', s == 2))
+        layout.addWidget(cb_recent)
+        
+        cb_recommended = QCheckBox("推荐")
+        cb_recommended.setChecked(self.show_recommended)
+        cb_recommended.stateChanged.connect(lambda s: setattr(self, 'show_recommended', s == 2))
+        layout.addWidget(cb_recommended)
+        
+        # 显示数量
+        layout.addWidget(QLabel("显示数量"))
+        spin_max = QSpinBox()
+        spin_max.setRange(10, 200)
+        spin_max.setValue(self.max_display)
+        spin_max.valueChanged.connect(lambda v: setattr(self, 'max_display', v))
+        layout.addWidget(spin_max)
+        
+        layout.addStretch()
+        
+        # 确定按钮
+        btn_ok = QPushButton("确定")
+        btn_ok.clicked.connect(settings_dialog.accept)
+        layout.addWidget(btn_ok)
+        
+        if settings_dialog.exec_() == QDialog.Accepted:
+            self.load_tags()
+    
+    def keyPressEvent(self, event):
+        """处理键盘事件"""
+        if event.key() == Qt.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(event)
+
+# === 4. 主界面 ===
+class ClipboardApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.db = DBManager()
+        self.last_clipboard_text = ""
+        self.monitor_enabled = True
+
+        self.setWindowTitle("印象记忆_Dark (标签云增强版)")
+        self.resize(1300, 850)
+        self.apply_style()
+
+        # === 核心布局 ===
+        self.central_container = QWidget()
+        self.setCentralWidget(self.central_container)
+        self.central_layout = QVBoxLayout(self.central_container)
+        self.central_layout.setContentsMargins(0, 0, 0, 0)
+        self.central_layout.setSpacing(0)
+
+        self.init_top_bar()
+        self.init_table()
+        self.init_metadata_panel()
+        self.init_tag_panel()
+        self.load_data()
+        
+        # 恢复窗口状态
+        self.restore_window_state()
+
+        self.clipboard = QApplication.clipboard()
+        self.clipboard.dataChanged.connect(self.on_clipboard_change)
+        
+        self.group_shortcut = QShortcut(QKeySequence("Ctrl+G"), self)
+        self.group_shortcut.activated.connect(self.group_selected_items)
+        
+        # 已使用的颜色集合
+        self.used_colors = set()
+        
+        # 编辑模式标志
+        self.edit_mode = False  # False=读取模式, True=编辑模式
+
+    def apply_style(self):
+        self.setStyleSheet("""
+            QMainWindow { background-color: #11111b; } /* 极深色背景 */
+            QWidget { color: #cdd6f4; font-family: "Segoe UI", "Microsoft YaHei"; font-size: 13px; }
+            
+            /* Dock 标题栏极简化 */
+            QDockWidget::title { background: #181825; padding-left: 5px; padding-top: 4px; border-bottom: 1px solid #313244; }
+            
+            /* 输入框彻底去除白色 */
+            QLineEdit, QScrollArea { 
+                background-color: #1e1e2e; /* 深灰背景 */
+                border: 1px solid #313244; 
+                border-radius: 4px; 
+                color: #cdd6f4; 
+            }
+            QTextEdit { 
+                background-color: #262637; /* 预览框更深的背景 */
+                border: 1px solid #313244; 
+                border-radius: 4px; 
+                color: #cdd6f4; 
+            }
+            QLineEdit:focus, QTextEdit:focus { border: 1px solid #89b4fa; }
+
+            /* 按钮样式 */
+            QPushButton { background-color: #313244; border: 1px solid #45475a; border-radius: 4px; padding: 5px 10px; }
+            QPushButton:hover { background-color: #45475a; border-color: #89b4fa; }
+            QPushButton:pressed { background-color: #89b4fa; color: #1e1e2e; }
+
+            /* 标签按钮 */
+            QPushButton#TagCloudBtn { 
+                background-color: #181825; 
+                border: 1px solid #585b70; 
+                border-radius: 12px; 
+                padding: 4px 10px; 
+                font-size: 12px;
+                text-align: left;
+            }
+            QPushButton#TagCloudBtn:hover { border-color: #89b4fa; color: #fff; background-color: #313244; }
+
+            /* 表格 */
+            QTableWidget { background-color: #11111b; border: none; gridline-color: #1e1e2e; selection-background-color: #313244; selection-color: #89b4fa; }
+            QHeaderView::section { background-color: #181825; color: #a6adc8; border: none; padding: 6px; font-weight: bold; }
+        """)
+
+    def init_top_bar(self):
+        top_frame = QFrame()
+        top_frame.setFixedHeight(50)
+        top_frame.setStyleSheet("background-color: #181825; border-bottom: 1px solid #313244;")
+        layout = QHBoxLayout(top_frame)
+        layout.setContentsMargins(10, 5, 10, 5)
+        
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("🔍 搜索...")
+        self.search_input.setFixedWidth(250)
+        self.search_input.returnPressed.connect(lambda: self.load_data())
+        layout.addWidget(self.search_input)
+
+        layout.addWidget(QLabel(" | 筛选: "))
+        self.btn_all = QPushButton("全部"); self.btn_all.setCheckable(True); self.btn_all.setChecked(True)
+        self.btn_fav = QPushButton("仅收藏"); self.btn_fav.setCheckable(True)
+        self.btn_lock = QPushButton("仅禁删"); self.btn_lock.setCheckable(True)
+        
+        for btn in [self.btn_all, self.btn_fav, self.btn_lock]:
+            btn.clicked.connect(lambda _, b=btn: self.switch_filter(b))
+            layout.addWidget(btn)
+        
+        layout.addStretch()
+        layout.addWidget(QLabel("排序:"))
+        self.sort_combo = QComboBox()
+        self.sort_combo.setStyleSheet("background-color: #313244; color: white;")
+        self.sort_combo.addItems(["✋ 手动拖拽", "🕒 创建时间", "💾 大小", "🔥 热度", "⭐ 星级"])
+        self.sort_map = {0: "manual", 1: "time_desc", 2: "size_desc", 3: "visit_desc", 4: "stars_desc"}
+        self.sort_combo.currentIndexChanged.connect(lambda: self.load_data())
+        layout.addWidget(self.sort_combo)
+
+        btn_refresh = QPushButton("刷新"); btn_refresh.clicked.connect(lambda: self.load_data())
+        layout.addWidget(btn_refresh)
+        
+        # 自动删除按钮
+        btn_auto_delete = QPushButton("🗑️")
+        btn_auto_delete.clicked.connect(self.auto_delete_old_items)
+        layout.addWidget(btn_auto_delete)
+        
+        # 模式切换按钮
+        self.mode_btn = QPushButton("📖 读取模式")
+        self.mode_btn.setCheckable(True)
+        self.mode_btn.clicked.connect(self.toggle_edit_mode)
+        layout.addWidget(self.mode_btn)
+
+        self.central_layout.addWidget(top_frame)
+        self.current_filter = None
+
+    def init_table(self):
+        self.table = DraggableTableWidget()
+        cols = ["序", "状态", "备注", "星级", "大小", "访问", "创建时间", "访问时间", "内容", "ID"]
+        self.table.setColumnCount(len(cols))
+        self.table.setHorizontalHeaderLabels(cols)
+        self.table.setColumnHidden(9, True)
+        
+        w = self.table.setColumnWidth
+        w(0, 40); w(1, 50); w(2, 120); w(3, 60); w(4, 70); w(5, 40); w(6, 140); w(7, 140)
+        self.table.horizontalHeader().setSectionResizeMode(8, QHeaderView.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.show_context_menu)
+        self.table.itemSelectionChanged.connect(self.update_dock_panel)
+        self.table.itemDoubleClicked.connect(self.on_table_double_click)  # 双击事件
+        
+        # 表头右键菜单
+        self.table.horizontalHeader().setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.horizontalHeader().customContextMenuRequested.connect(self.show_header_menu)
+        
+        self.central_layout.addWidget(self.table)
+
+    def init_metadata_panel(self):
+        """创建元数据面板"""
+        self.metadata_dock = QDockWidget("📊 元数据", self)
+        self.metadata_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea | Qt.BottomDockWidgetArea)  # 禁止停靠到顶部
+        self.metadata_dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
+        
+        metadata_content = QWidget()
+        metadata_content.setStyleSheet("background-color: #11111b;")
+        layout = QVBoxLayout(metadata_content)
+        layout.setContentsMargins(10, 10, 10, 10)
+        
+        # 使用QSplitter使预览框可调整大小
+        splitter = QSplitter(Qt.Vertical)
+        
+        # 内容预览
+        self.preview_text = QTextEdit()
+        self.preview_text.setReadOnly(True)
+        self.preview_text.setMinimumHeight(100)
+        splitter.addWidget(self.preview_text)
+        
+        # 下半部分容器
+        bottom_widget = QWidget()
+        bottom_layout = QVBoxLayout(bottom_widget)
+        bottom_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # 提取内容按钮
+        btn_copy = QPushButton("提取内容")
+        btn_copy.clicked.connect(self.extract_content)
+        bottom_layout.addWidget(btn_copy)
+        
+        bottom_layout.addSpacing(15)
+        
+        # 备注
+        bottom_layout.addWidget(QLabel("📝 备注"))
+        self.note_input = QLineEdit()
+        self.note_input.returnPressed.connect(self.save_note)
+        bottom_layout.addWidget(self.note_input)
+        
+        bottom_layout.addStretch()
+        
+        splitter.addWidget(bottom_widget)
+        splitter.setStretchFactor(0, 3)  # 预览框占3份
+        splitter.setStretchFactor(1, 2)  # 下半部分占2份
+        
+        layout.addWidget(splitter)
+        
+        self.metadata_dock.setWidget(metadata_content)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.metadata_dock)
+    
+    def init_tag_panel(self):
+        """创建标签面板"""
+        self.tag_dock = QDockWidget("🏷️ 标签", self)
+        self.tag_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea | Qt.BottomDockWidgetArea)  # 禁止停靠到顶部
+        self.tag_dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
+        
+        tag_content = QWidget()
+        tag_content.setStyleSheet("background-color: #11111b;")
+        layout = QVBoxLayout(tag_content)
+        layout.setContentsMargins(10, 10, 10, 10)
+        
+        # 当前标签区域
+        layout.addWidget(QLabel("当前标签:"))
+        self.current_tag_area = QWidget()
+        self.current_tag_layout = QHBoxLayout(self.current_tag_area)
+        self.current_tag_layout.setContentsMargins(0, 0, 0, 0)
+        self.current_tag_layout.setAlignment(Qt.AlignLeft)
+        layout.addWidget(self.current_tag_area)
+        
+        layout.addSpacing(15)
+        
+        # 标签云/历史标签
+        layout.addWidget(QLabel("📚 标签库 (点击添加):"))
+        self.tag_cloud_area = QScrollArea()
+        self.tag_cloud_area.setWidgetResizable(True)
+        self.tag_cloud_container = QWidget()
+        self.tag_cloud_layout = QVBoxLayout(self.tag_cloud_container)
+        self.tag_cloud_layout.setAlignment(Qt.AlignTop)
+        self.tag_cloud_area.setWidget(self.tag_cloud_container)
+        layout.addWidget(self.tag_cloud_area)
+        
+        # 添加新标签按钮
+        btn_new_tag = QPushButton("+ 新建标签")
+        btn_new_tag.clicked.connect(self.add_tag_action)
+        layout.addWidget(btn_new_tag)
+        
+        self.tag_dock.setWidget(tag_content)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.tag_dock)
+
+    # === 逻辑部分 ===
+    def switch_filter(self, btn):
+        self.btn_all.setChecked(False); self.btn_fav.setChecked(False); self.btn_lock.setChecked(False)
+        btn.setChecked(True)
+        if btn == self.btn_fav: self.current_filter = "favorite"
+        elif btn == self.btn_lock: self.current_filter = "locked"
+        else: self.current_filter = None
+        self.load_data()
+
+    def format_size(self, text):
+        b = len(text.encode('utf-8'))
+        if b < 1024: return f"{b} B"
+        elif b < 1024**2: return f"{b/1024:.1f} KB"
+        return f"{b/1024**2:.1f} MB"
+
+    def load_data(self, select_id=None):
+        """加载数据,并可选择性地选中指定id的项目"""
+        search = self.search_input.text().strip()
+        sort = self.sort_map.get(self.sort_combo.currentIndex(), "manual")
+        items = self.db.get_all_items(self.current_filter, search, sort)
+        self.table.setRowCount(0)
+        
+        select_row = -1
+        for i, item in enumerate(items):
+            self.insert_row(item, i+1)
+            if select_id and item.id == select_id:
+                select_row = i
+        
+        self.refresh_tag_cloud()
+        
+        # 选中指定行
+        if select_row >= 0:
+            self.table.selectRow(select_row)
+            self.table.scrollToItem(self.table.item(select_row, 0))
+
+    def insert_row(self, item, idx):
+        r = self.table.rowCount(); self.table.insertRow(r)
+        
+        # 序号
+        seq_item = QTableWidgetItem(str(idx))
+        seq_item.setTextAlignment(Qt.AlignCenter)
+        self.table.setItem(r, 0, seq_item)
+        
+        # 状态
+        status = ""
+        if item.is_pinned: status += "📌"
+        if item.is_favorite: status += "❤️"
+        if item.is_locked: status += "🔒"
+        status_item = QTableWidgetItem(status)
+        status_item.setTextAlignment(Qt.AlignCenter)
+        self.table.setItem(r, 1, status_item)
+        
+        # 备注
+        note_item = QTableWidgetItem(item.note)
+        self.table.setItem(r, 2, note_item)
+        
+        # 星级 - 使用金色★符号
+        stars = "★" * item.star_level if item.star_level > 0 else ""
+        star_item = QTableWidgetItem(stars)
+        star_item.setTextAlignment(Qt.AlignCenter)
+        star_item.setForeground(QColor("#FFD700"))  # 金色
+        self.table.setItem(r, 3, star_item)
+        
+        # 大小
+        size_item = QTableWidgetItem(self.format_size(item.content))
+        size_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.table.setItem(r, 4, size_item)
+        
+        # 访问次数
+        visit_item = QTableWidgetItem(str(item.visit_count))
+        visit_item.setTextAlignment(Qt.AlignCenter)
+        self.table.setItem(r, 5, visit_item)
+        
+        # 创建时间 - 精确到秒
+        created_item = QTableWidgetItem(item.created_at.strftime("%Y-%m-%d %H:%M:%S"))
+        self.table.setItem(r, 6, created_item)
+        
+        # 访问时间 - 精确到秒
+        visited_item = QTableWidgetItem(item.last_visited_at.strftime("%Y-%m-%d %H:%M:%S") if item.last_visited_at else "")
+        self.table.setItem(r, 7, visited_item)
+        
+        # 内容
+        content_item = QTableWidgetItem(item.content[:60].replace('\n', ' '))
+        self.table.setItem(r, 8, content_item)
+        
+        # ID(隐藏)
+        id_item = QTableWidgetItem(str(item.id))
+        self.table.setItem(r, 9, id_item)
+        
+        # 应用分组颜色
+        if item.group_color:
+            for col in range(9):
+                cell_item = self.table.item(r, col)
+                if cell_item:
+                    cell_item.setBackground(QColor(item.group_color))
+        
+        # 应用自定义颜色(优先级高于分组颜色)
+        if item.custom_color:
+            for col in range(9):
+                cell_item = self.table.item(r, col)
+                if cell_item:
+                    cell_item.setBackground(QColor(item.custom_color))
+
+    def show_context_menu(self, pos):
+        idx = self.table.indexAt(pos)
+        if not idx.isValid(): return
+        
+        # 获取选中的所有行
+        selected_rows = self.table.selectionModel().selectedRows()
+        if not selected_rows: return
+        
+        item_ids = [int(self.table.item(row.row(), 9).text()) for row in selected_rows]
+        is_batch = len(item_ids) > 1
+        
+        menu = QMenu()
+        menu.setStyleSheet("QMenu { background-color: #313244; color: white; border: 1px solid #45475a; }")
+        
+        # 星级设置 - 只显示星号
+        star_menu = menu.addMenu("⭐ 设置星级")
+        star_labels = ["无", "★", "★★", "★★★", "★★★★", "★★★★★"]
+        for i in range(6): 
+            action = star_menu.addAction(star_labels[i])
+            action.triggered.connect(lambda _, level=i, ids=item_ids: self.batch_set_star(ids, level))
+        
+        menu.addSeparator()
+        menu.addAction(f"❤️ 收藏/取消 ({len(item_ids)}项)").triggered.connect(lambda: self.batch_toggle_field(item_ids, 'is_favorite'))
+        menu.addAction(f"📌 置顶/取消 ({len(item_ids)}项)").triggered.connect(lambda: self.batch_toggle_field(item_ids, 'is_pinned'))
+        menu.addAction(f"🔒 锁定/解锁 ({len(item_ids)}项)").triggered.connect(lambda: self.batch_toggle_field(item_ids, 'is_locked'))
+        menu.addSeparator()
+        menu.addAction(f"🎨 设置颜色 ({len(item_ids)}项)").triggered.connect(lambda: self.set_custom_color(item_ids))
+        menu.addSeparator()
+        menu.addAction(f"❌ 删除 ({len(item_ids)}项)").triggered.connect(lambda: self.batch_delete(item_ids))
+        
+        menu.exec_(self.table.mapToGlobal(pos))
+    
+    def show_header_menu(self, pos):
+        """显示表头右键菜单 - 设置对齐方式"""
+        col = self.table.horizontalHeader().logicalIndexAt(pos)
+        if col < 0 or col >= self.table.columnCount():
+            return
+        
+        menu = QMenu()
+        menu.setStyleSheet("QMenu { background-color: #313244; color: white; border: 1px solid #45475a; }")
+        
+        menu.addAction("← 靠左对齐").triggered.connect(lambda: self.set_column_alignment(col, Qt.AlignLeft | Qt.AlignVCenter))
+        menu.addAction("↔ 居中对齐").triggered.connect(lambda: self.set_column_alignment(col, Qt.AlignCenter))
+        menu.addAction("→ 靠右对齐").triggered.connect(lambda: self.set_column_alignment(col, Qt.AlignRight | Qt.AlignVCenter))
+        
+        menu.exec_(self.table.horizontalHeader().mapToGlobal(pos))
+    
+    def set_column_alignment(self, col, alignment):
+        """设置整列的对齐方式"""
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, col)
+            if item:
+                item.setTextAlignment(alignment)
+        
+        # 保存对齐设置
+        settings = QSettings("ClipboardApp", "WindowState")
+        settings.setValue(f"column_{col}_alignment", int(alignment))
+
+    def batch_set_star(self, item_ids, level):
+        """批量设置星级"""
+        session = self.db.get_session()
+        try:
+            for item_id in item_ids:
+                item = session.query(ClipboardItem).get(item_id)
+                if item: item.star_level = level
+            session.commit()
+        finally:
+            session.close()
+        self.load_data(select_id=item_ids[0] if item_ids else None)
+    
+    def batch_toggle_field(self, item_ids, field):
+        """批量切换布尔字段"""
+        session = self.db.get_session()
+        try:
+            for item_id in item_ids:
+                item = session.query(ClipboardItem).get(item_id)
+                if item: setattr(item, field, not getattr(item, field))
+            session.commit()
+        finally:
+            session.close()
+        self.load_data(select_id=item_ids[0] if item_ids else None)
+    
+    def batch_delete(self, item_ids):
+        """批量删除"""
+        reply = QMessageBox.question(self, "确认删除", 
+                                     f"确定要删除 {len(item_ids)} 个项目吗?",
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        
+        session = self.db.get_session()
+        try:
+            for item_id in item_ids:
+                item = session.query(ClipboardItem).get(item_id)
+                if item and not item.is_locked:
+                    session.delete(item)
+            session.commit()
+        finally:
+            session.close()
+        self.load_data()
+    
+    def toggle_bool(self, pid, field):
+        session = self.db.get_session()
+        item = session.query(ClipboardItem).get(pid)
+        if item: setattr(item, field, not getattr(item, field)); session.commit()
+        session.close()
+        self.load_data(select_id=pid)
+
+    def toggle_edit_mode(self):
+        """切换编辑/读取模式"""
+        self.edit_mode = not self.edit_mode
+        if self.edit_mode:
+            self.mode_btn.setText("✏️ 编辑模式")
+            self.table.setEditTriggers(QAbstractItemView.DoubleClicked)
+            self.table.setDragEnabled(True)  # 编辑模式允许拖拽
+        else:
+            self.mode_btn.setText("📖 读取模式")
+            self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+            self.table.setDragEnabled(False)  # 读取模式禁止拖拽
+        self.mode_btn.setChecked(self.edit_mode)
+    
+    def on_table_double_click(self, item):
+        """处理表格双击事件"""
+        if not self.edit_mode:
+            # 读取模式:发送到剪贴板
+            row = item.row()
+            item_id = int(self.table.item(row, 9).text())
+            session = self.db.get_session()
+            db_item = session.query(ClipboardItem).get(item_id)
+            if db_item:
+                self.monitor_enabled = False
+                self.clipboard.setText(db_item.content)
+                self.monitor_enabled = True
+                self.statusBar().showMessage("✅ 已发送到剪贴板")
+            session.close()
+
+    # === 面板与标签逻辑 ===
+    def update_dock_panel(self):
+        sel = self.table.selectedItems()
+        if not sel: self.clear_dock(); return
+        pid = int(self.table.item(sel[0].row(), 9).text())
+        
+        session = self.db.get_session()
+        item = session.query(ClipboardItem).get(pid)
+        if item:
+            self.current_id = item.id
+            self.preview_text.setText(item.content)
+            self.note_input.setText(item.note)
+            self.render_current_tags(item.tags)
+        session.close()
+
+    def render_current_tags(self, tags):
+        """渲染当前Item已有的标签"""
+        # 清空
+        for i in reversed(range(self.current_tag_layout.count())): 
+            w = self.current_tag_layout.itemAt(i).widget()
+            if w: w.setParent(None)
+            
+        for tag in tags:
+            btn = QPushButton(f"{tag.name} ✖")
+            btn.setStyleSheet("background-color: #313244; color: #89b4fa; border: 1px solid #89b4fa; border-radius: 10px;")
+            btn.setCursor(Qt.PointingHandCursor)
+            # 点击删除标签
+            btn.clicked.connect(lambda _, t=tag.name: self.del_tag(t))
+            self.current_tag_layout.addWidget(btn)
+
+    def refresh_tag_cloud(self):
+        """渲染历史标签库 (标签云)"""
+        # 清空
+        for i in reversed(range(self.tag_cloud_layout.count())): 
+            w = self.tag_cloud_layout.itemAt(i).widget()
+            if w: w.setParent(None)
+
+        # 获取数据: [(name, count), ...]
+        tags_data = self.db.get_tag_cloud()
+        
+        for name, count in tags_data:
+            # 创建带统计数字的按钮
+            btn = QPushButton(f"🏷️ {name}  ({count})")
+            btn.setObjectName("TagCloudBtn")
+            btn.setCursor(Qt.PointingHandCursor)
+            # 点击将该标签添加到当前选中的Item
+            btn.clicked.connect(lambda _, t=name: self.apply_tag_from_cloud(t))
+            self.tag_cloud_layout.addWidget(btn)
+
+    def apply_tag_from_cloud(self, tag_name):
+        if hasattr(self, 'current_id'):
+            self.db.add_tags_to_items([self.current_id], tag_name)
+            self.update_dock_panel() # 刷新当前Item标签
+            self.refresh_tag_cloud() # 刷新计数
+
+    def del_tag(self, name):
+        if hasattr(self, 'current_id'):
+            self.db.remove_tag_from_item(self.current_id, name)
+            self.update_dock_panel()
+            self.refresh_tag_cloud()
+
+    def add_tag_action(self):
+        if hasattr(self, 'current_id'):
+            dialog = TagSelectorDialog(self.db, self.current_id, self)
+            dialog.show()  # 非模态显示
+
+    def clear_dock(self):
+        self.preview_text.clear(); self.note_input.clear()
+        for i in reversed(range(self.current_tag_layout.count())): 
+            w = self.current_tag_layout.itemAt(i).widget(); 
+            if w: w.setParent(None)
+
+    def save_note(self):
+        if hasattr(self, 'current_id'):
+            self.db.update_field(self.current_id, 'note', self.note_input.text())
+            r = self.table.currentRow()
+            if r >= 0: self.table.item(r, 2).setText(self.note_input.text())
+
+    def extract_content(self):
+        if hasattr(self, 'current_id'):
+            self.monitor_enabled = False
+            self.clipboard.setText(self.preview_text.toPlainText())
+            self.monitor_enabled = True
+            session = self.db.get_session()
+            item = session.query(ClipboardItem).get(self.current_id)
+            if item: item.visit_count += 1; item.last_visited_at = datetime.now(); session.commit()
+            session.close()
+            r = self.table.currentRow()
+            if r >= 0: self.table.item(r, 5).setText(str(int(self.table.item(r, 5).text())+1))
+
+    def update_db_order(self, ids):
+        if self.sort_combo.currentIndex() != 0:
+            QMessageBox.warning(self, "提示", "请切换到'手动拖拽'模式"); self.load_data(); return
+        self.db.update_sort_order(ids)
+
+    @pyqtSlot()
+    def on_clipboard_change(self):
+        if not self.monitor_enabled: return
+        try:
+            m = self.clipboard.mimeData()
+            if not m.hasText(): return
+            t = m.text().strip()
+            if not t or t == self.last_clipboard_text: return
+            self.last_clipboard_text = t
+            item, is_new = self.db.add_item(t)
+            if self.sort_combo.currentIndex() == 0: self.load_data()
+        except: pass
+    
+    # === 分组功能 ===
+    def group_selected_items(self):
+        """将选中的多个项目分组并分配颜色"""
+        selected_rows = self.table.selectionModel().selectedRows()
+        if len(selected_rows) < 2:
+            QMessageBox.information(self, "提示", "请至少选择2个项目进行分组")
+            return
+        
+        # 获取选中项目的ID
+        item_ids = []
+        for index in selected_rows:
+            row = index.row()
+            item_id = int(self.table.item(row, 9).text())
+            item_ids.append(item_id)
+        
+        # 生成唯一的随机颜色
+        group_color = self.generate_unique_color()
+        
+        # 更新数据库
+        session = self.db.get_session()
+        try:
+            for item_id in item_ids:
+                item = session.query(ClipboardItem).get(item_id)
+                if item:
+                    item.group_color = group_color
+            session.commit()
+            self.statusBar().showMessage(f"已将 {len(item_ids)} 个项目分组,颜色: {group_color}")
+        finally:
+            session.close()
+        
+        # 刷新显示
+        self.load_data()
+    
+    def generate_unique_color(self):
+        """生成唯一的随机颜色(柔和的深色系)"""
+        import random
+        
+        # 预定义的柔和深色调色板
+        color_palette = [
+            "#2d3748",  # 深灰蓝
+            "#2c5282",  # 深蓝
+            "#2f855a",  # 深绿
+            "#744210",  # 深棕
+            "#5a2e5e",  # 深紫
+            "#2c5f5f",  # 深青
+            "#4a5568",  # 深灰
+            "#5a3825",  # 深褐
+            "#2d4a3e",  # 深墨绿
+            "#3d3846",  # 深紫灰
+            "#2e4057",  # 深蓝灰
+            "#4a3f35",  # 深卡其
+        ]
+        
+        # 找出未使用的颜色
+        available_colors = [c for c in color_palette if c not in self.used_colors]
+        
+        # 如果所有颜色都用完了,清空已使用颜色集合
+        if not available_colors:
+            self.used_colors.clear()
+            available_colors = color_palette
+        
+        # 随机选择一个颜色
+        color = random.choice(available_colors)
+        self.used_colors.add(color)
+        
+        return color
+
+    def set_custom_color(self, item_ids):
+        """设置自定义颜色"""
+        from PyQt5.QtWidgets import QColorDialog
+        color = QColorDialog.getColor()
+        if color.isValid():
+            color_hex = color.name()
+            session = self.db.get_session()
+            try:
+                for item_id in item_ids:
+                    item = session.query(ClipboardItem).get(item_id)
+                    if item:
+                        item.custom_color = color_hex
+                session.commit()
+            finally:
+                session.close()
+            self.load_data(select_id=item_ids[0] if item_ids else None)
+    
+    def auto_delete_old_items(self):
+        """清理21天前的旧数据"""
+        reply = QMessageBox.question(
+            self, 
+            "确认清理", 
+            "确定要删除21天前的数据吗?\n(已锁定的数据不会被删除)",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            count = self.db.auto_delete_old_data(21)
+            QMessageBox.information(self, "清理完成", f"已删除 {count} 条旧数据")
+            self.load_data()
+    
+    # === 窗口状态管理 ===
+    def save_window_state(self):
+        """保存窗口状态"""
+        settings = QSettings("ClipboardApp", "WindowState")
+        
+        # 保存主窗口状态
+        settings.setValue("geometry", self.saveGeometry())
+        settings.setValue("windowState", self.saveState())
+        
+        # 保存UI状态
+        settings.setValue("currentFilter", self.btn_fav.isChecked() and "favorite" or (self.btn_lock.isChecked() and "locked" or "all"))
+        settings.setValue("sortIndex", self.sort_combo.currentIndex())
+        
+        # 保存列宽
+        column_widths = []
+        for i in range(self.table.columnCount()):
+            column_widths.append(self.table.columnWidth(i))
+        settings.setValue("columnWidths", column_widths)
+    
+    def restore_window_state(self):
+        """恢复窗口状态"""
+        settings = QSettings("ClipboardApp", "WindowState")
+        
+        # 恢复主窗口状态
+        geometry = settings.value("geometry")
+        if geometry:
+            self.restoreGeometry(geometry)
+        
+        window_state = settings.value("windowState")
+        if window_state:
+            self.restoreState(window_state)
+        
+        # 恢复UI状态
+        filter_type = settings.value("currentFilter", "all")
+        if filter_type == "favorite":
+            self.btn_fav.setChecked(True)
+            self.btn_all.setChecked(False)
+            self.current_filter = "favorite"
+        elif filter_type == "locked":
+            self.btn_lock.setChecked(True)
+            self.btn_all.setChecked(False)
+            self.current_filter = "locked"
+        
+        sort_index = settings.value("sortIndex", 0)
+        if sort_index:
+            self.sort_combo.setCurrentIndex(int(sort_index))
+        
+        # 恢复列宽
+        column_widths = settings.value("columnWidths")
+        if column_widths:
+            for i, width in enumerate(column_widths):
+                if i < self.table.columnCount():
+                    self.table.setColumnWidth(i, int(width))
+    
+    def closeEvent(self, event):
+        """窗口关闭时保存状态"""
+        self.save_window_state()
+        event.accept()
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = AICodeEditor(root)
-    root.mainloop()
+    app = QApplication(sys.argv)
+    window = ClipboardApp()
+    window.show()
+    sys.exit(app.exec_())
+
+# =================== color_selector.py ===================
+
+from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
+                             QGridLayout, QPushButton, QLineEdit)
+from PyQt5.QtGui import QColor
+from PyQt5.QtCore import Qt, QSettings
+
+class ColorSelectorDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("颜色选择")
+        self.setMinimumSize(400, 500)
+        self.selected_color = None
+        
+        # 应用深色主题
+        self.setStyleSheet("""
+            QDialog { background-color: #1e1e2e; color: #cdd6f4; }
+            QLabel { color: #a6adc8; font-size: 13px; font-weight: bold; margin-top: 10px; }
+            QPushButton { border: none; border-radius: 4px; }
+            QPushButton:hover { border: 2px solid #89b4fa; }
+            QLineEdit { 
+                background-color: #11111b; border: 1px solid #313244; 
+                border-radius: 4px; padding: 8px; color: #cdd6f4; 
+            }
+        """)
+        
+        self.init_ui()
+        self.load_history()
+    
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(15)
+        
+        # 1. 推荐颜色 (莫兰迪/柔和色系)
+        layout.addWidget(QLabel("🎨 推荐颜色"))
+        grid_rec = QGridLayout()
+        grid_rec.setSpacing(8)
+        
+        rec_colors = [
+            "#ffadad", "#ffd6a5", "#fdffb6", "#caffbf", "#9bf6ff", "#a0c4ff", "#bdb2ff", "#ffc6ff",
+            "#ef476f", "#ffd166", "#06d6a0", "#118ab2", "#073b4c", "#f72585", "#7209b7", "#3a0ca3"
+        ]
+        
+        for i, color in enumerate(rec_colors):
+            btn = self.create_color_btn(color)
+            grid_rec.addWidget(btn, i // 8, i % 8)
+        layout.addLayout(grid_rec)
+        
+        # 2. 最近使用/常用颜色
+        layout.addWidget(QLabel("🕒 最近使用"))
+        self.grid_history = QGridLayout()
+        self.grid_history.setSpacing(8)
+        layout.addLayout(self.grid_history)
+        
+        # 3. 自定义颜色
+        layout.addWidget(QLabel("✏️ 自定义"))
+        custom_layout = QHBoxLayout()
+        self.hex_input = QLineEdit()
+        self.hex_input.setPlaceholderText("#RRGGBB")
+        self.hex_input.textChanged.connect(self.update_preview)
+        custom_layout.addWidget(self.hex_input)
+        
+        self.preview_btn = QPushButton()
+        self.preview_btn.setFixedSize(36, 36)
+        self.preview_btn.setStyleSheet("background-color: transparent; border: 1px solid #45475a;")
+        custom_layout.addWidget(self.preview_btn)
+        
+        btn_pick = QPushButton("调色板")
+        btn_pick.setStyleSheet("background-color: #313244; color: white; padding: 8px 12px;")
+        btn_pick.clicked.connect(self.open_color_dialog)
+        custom_layout.addWidget(btn_pick)
+        
+        layout.addLayout(custom_layout)
+        
+        layout.addStretch()
+        
+        # 底部按钮
+        btn_layout = QHBoxLayout()
+        btn_clear = QPushButton("清除颜色")
+        btn_clear.setStyleSheet("background-color: #313244; color: #f38ba8; padding: 8px 16px;")
+        btn_clear.clicked.connect(self.clear_color)
+        btn_layout.addWidget(btn_clear)
+        
+        btn_layout.addStretch()
+        
+        btn_cancel = QPushButton("取消")
+        btn_cancel.setStyleSheet("background-color: #313244; color: white; padding: 8px 16px;")
+        btn_cancel.clicked.connect(self.reject)
+        btn_layout.addWidget(btn_cancel)
+        
+        btn_ok = QPushButton("确定")
+        btn_ok.setStyleSheet("background-color: #89b4fa; color: #1e1e2e; padding: 8px 16px;")
+        btn_ok.clicked.connect(self.accept_custom)
+        btn_layout.addWidget(btn_ok)
+        
+        layout.addLayout(btn_layout)
+    
+    def create_color_btn(self, color):
+        btn = QPushButton()
+        btn.setFixedSize(32, 32)
+        btn.setStyleSheet(f"background-color: {color}; border-radius: 16px;")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.clicked.connect(lambda: self.select_color(color))
+        return btn
+    
+    def load_history(self):
+        # 从QSettings加载历史
+        settings = QSettings("ClipboardApp", "ColorHistory")
+        history = settings.value("colors", [])
+        if not history: history = ["#ffffff", "#000000", "#808080"]
+        
+        # 清除旧的
+        for i in reversed(range(self.grid_history.count())): 
+            self.grid_history.itemAt(i).widget().setParent(None)
+            
+        for i, color in enumerate(history[:16]): # 最多显示16个
+            btn = self.create_color_btn(color)
+            self.grid_history.addWidget(btn, i // 8, i % 8)
+            
+    def save_history(self, color):
+        settings = QSettings("ClipboardApp", "ColorHistory")
+        history = settings.value("colors", [])
+        if color in history: history.remove(color)
+        history.insert(0, color)
+        settings.setValue("colors", history[:16])
+    
+    def select_color(self, color):
+        self.selected_color = color
+        self.save_history(color)
+        self.accept()
+        
+    def update_preview(self, text):
+        if QColor(text).isValid():
+            self.preview_btn.setStyleSheet(f"background-color: {text}; border-radius: 4px;")
+            
+    def open_color_dialog(self):
+        from PyQt5.QtWidgets import QColorDialog
+        color = QColorDialog.getColor()
+        if color.isValid():
+            self.hex_input.setText(color.name())
+            self.selected_color = color.name()
+            
+    def accept_custom(self):
+        text = self.hex_input.text()
+        if QColor(text).isValid():
+            self.select_color(text)
+        elif self.selected_color:
+            self.select_color(self.selected_color)
+        else:
+            self.reject()
+            
+    def clear_color(self):
+        self.selected_color = "" # 空字符串表示清除
+        self.accept()
