@@ -1,0 +1,21 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Database files
+*.db
+*.sqlite3
+
+# Log files
+*.log
+
+# Image files
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+# VS Code
+.vscode/
