@@ -23,6 +23,8 @@ except ImportError:
     print("请安装库: pip install PyQt5 SQLAlchemy")
     sys.exit(1)
 
+from color_selector import ColorSelectorDialog
+
 Base = declarative_base()
 
 # 关联表
@@ -495,7 +497,7 @@ class TagSelectorDialog(QDialog):
         layout.addWidget(hint_label)
     
     def load_tags(self):
-        """加载所有标签"""
+        """加载所有标签,适配不同视图"""
         self.tag_list.clear()
         tags_data = self.db.get_tag_cloud()
         
@@ -507,9 +509,18 @@ class TagSelectorDialog(QDialog):
             filtered_tags.append((name, count))
         
         for name, count in filtered_tags:
-            item = QListWidgetItem(f"🏷️ {name}  ({count})")
-            item.setData(Qt.UserRole, name)  # 存储标签名
+            if self.view_mode == "grid":
+                item = QListWidgetItem(name)
+                item.setToolTip(f"{name} ({count}次引用)")
+                item.setTextAlignment(Qt.AlignCenter)
+            else: # list
+                item = QListWidgetItem(f"🏷️ {name}  ({count})")
+            
+            item.setData(Qt.UserRole, name)
             self.tag_list.addItem(item)
+            
+        # 重新应用搜索过滤器
+        self.filter_tags(self.search_input.text())
     
     def filter_tags(self, text):
         """根据搜索文本过滤标签"""
@@ -550,10 +561,24 @@ class TagSelectorDialog(QDialog):
     
     def switch_view(self, mode):
         """切换视图模式"""
+        if self.view_mode == mode: return
         self.view_mode = mode
-        # TODO: 实现网格视图
+        
         if mode == "grid":
-            QMessageBox.information(self, "提示", "网格视图功能开发中...")
+            self.tag_list.setViewMode(QListWidget.IconMode)
+            self.tag_list.setFlow(QListWidget.LeftToRight)
+            self.tag_list.setWrapping(True)
+            self.tag_list.setResizeMode(QListWidget.Adjust)
+            self.tag_list.setGridSize(QSize(100, 40))
+            self.tag_list.setMovement(QListWidget.Static)
+            self.tag_list.setSpacing(5)
+        else: # "list"
+            self.tag_list.setViewMode(QListWidget.ListMode)
+            # 恢复默认设置
+            self.tag_list.setGridSize(QSize(-1, -1))
+            self.tag_list.setWrapping(False)
+        
+        self.load_tags()
     
     def show_settings(self):
         """显示设置面板"""
@@ -619,18 +644,26 @@ class ClipboardApp(QMainWindow):
         self.db = DBManager()
         self.last_clipboard_text = ""
         self.monitor_enabled = True
+        self.drag_start_position = None
 
         self.setWindowTitle("印象记忆_Dark (标签云增强版)")
         self.resize(1300, 850)
+        
+        # 设置无边框窗口
+        self.setWindowFlags(Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+
         self.apply_style()
 
         # === 核心布局 ===
         self.central_container = QWidget()
+        self.central_container.setObjectName("centralContainer")
         self.setCentralWidget(self.central_container)
         self.central_layout = QVBoxLayout(self.central_container)
         self.central_layout.setContentsMargins(0, 0, 0, 0)
         self.central_layout.setSpacing(0)
 
+        self.init_title_bar()  # 初始化自定义标题栏
         self.init_top_bar()
         self.init_table()
         self.init_metadata_panel()
@@ -651,6 +684,23 @@ class ClipboardApp(QMainWindow):
         
         # 编辑模式标志
         self.edit_mode = False  # False=读取模式, True=编辑模式
+
+    def mousePressEvent(self, event):
+        """处理鼠标按下事件,用于窗口拖动"""
+        if event.button() == Qt.LeftButton and self.title_bar.underMouse():
+            self.drag_start_position = event.globalPos() - self.frameGeometry().topLeft()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        """处理鼠标移动事件,用于窗口拖动"""
+        if event.buttons() == Qt.LeftButton and self.drag_start_position is not None:
+            self.move(event.globalPos() - self.drag_start_position)
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        """处理鼠标释放事件"""
+        self.drag_start_position = None
+        event.accept()
 
     def apply_style(self):
         self.setStyleSheet("""
@@ -694,11 +744,125 @@ class ClipboardApp(QMainWindow):
             /* 表格 */
             QTableWidget { background-color: #11111b; border: none; gridline-color: #1e1e2e; selection-background-color: #313244; selection-color: #89b4fa; }
             QHeaderView::section { background-color: #181825; color: #a6adc8; border: none; padding: 6px; font-weight: bold; }
+            
+            /* 自定义标题栏 */
+            #titleBar {
+                background-color: #181825;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+            }
+            #centralContainer {
+                background-color: #11111b;
+                border-bottom-left-radius: 8px;
+                border-bottom-right-radius: 8px;
+            }
+            #titleLabel {
+                font-weight: bold;
+                padding-left: 5px;
+            }
+            
+            /* 标题栏按钮 */
+            #titleBarButton, #minimizeButton, #maximizeButton, #closeButton {
+                background-color: transparent;
+                border: none;
+                border-radius: 4px;
+                color: #cdd6f4;
+            }
+            #titleBarButton:hover, #minimizeButton:hover, #maximizeButton:hover {
+                background-color: #313244;
+            }
+            #closeButton:hover {
+                background-color: #f38ba8; /* 红色 */
+                color: #11111b;
+            }
         """)
+
+    def init_title_bar(self):
+        """初始化自定义标题栏"""
+        self.title_bar = QWidget()
+        self.title_bar.setObjectName("titleBar")
+        self.title_bar.setFixedHeight(32)
+        self.title_bar_layout = QHBoxLayout(self.title_bar)
+        self.title_bar_layout.setContentsMargins(5, 0, 5, 0)
+        self.title_bar_layout.setSpacing(10)
+
+        # 应用图标
+        self.icon_label = QLabel()
+        # 注意: 这里需要一个有效的图标路径, 暂时使用占位符. 后面需要创建资源文件.
+        # icon_pixmap = QPixmap(":/icons/app_icon.png").scaled(24, 24, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        # self.icon_label.setPixmap(icon_pixmap)
+        self.icon_label.setText("💾") # 临时图标
+        self.title_bar_layout.addWidget(self.icon_label)
+
+        # 标题
+        self.title_label = QLabel("印象记忆_Dark")
+        self.title_label.setObjectName("titleLabel")
+        self.title_bar_layout.addWidget(self.title_label)
+        
+        # 添加伸缩, 将按钮推到右侧
+        self.title_bar_layout.addStretch()
+        
+        # --- 功能按钮 ---
+        # 刷新按钮
+        self.btn_refresh = QPushButton("🔄")
+        self.btn_refresh.setObjectName("titleBarButton")
+        self.btn_refresh.setFixedSize(30, 30)
+        self.btn_refresh.setToolTip("刷新数据")
+        self.btn_refresh.clicked.connect(lambda: self.load_data())
+        self.title_bar_layout.addWidget(self.btn_refresh)
+
+        # 自动删除按钮
+        self.btn_auto_delete = QPushButton("🗑️")
+        self.btn_auto_delete.setObjectName("titleBarButton")
+        self.btn_auto_delete.setFixedSize(30, 30)
+        self.btn_auto_delete.setToolTip("清理旧数据")
+        self.btn_auto_delete.clicked.connect(self.auto_delete_old_items)
+        self.title_bar_layout.addWidget(self.btn_auto_delete)
+
+        # 模式切换按钮
+        self.mode_btn = QPushButton("📖")
+        self.mode_btn.setObjectName("titleBarButton")
+        self.mode_btn.setFixedSize(30, 30)
+        self.mode_btn.setCheckable(True)
+        self.mode_btn.setToolTip("切换读/写模式")
+        self.mode_btn.clicked.connect(self.toggle_edit_mode)
+        self.title_bar_layout.addWidget(self.mode_btn)
+
+        # 添加一个小的分隔线
+        separator = QFrame()
+        separator.setFrameShape(QFrame.VLine)
+        separator.setFrameShadow(QFrame.Sunken)
+        separator.setStyleSheet("color: #45475a;")
+        self.title_bar_layout.addWidget(separator)
+
+        # 窗口控制按钮
+        self.minimize_button = QPushButton("—")
+        self.minimize_button.setObjectName("minimizeButton")
+        self.minimize_button.setFixedSize(30, 30)
+        self.minimize_button.setToolTip("最小化")
+        self.minimize_button.clicked.connect(self.showMinimized)
+
+        self.maximize_button = QPushButton("⃞")
+        self.maximize_button.setObjectName("maximizeButton")
+        self.maximize_button.setFixedSize(30, 30)
+        self.maximize_button.setToolTip("最大化")
+        self.maximize_button.clicked.connect(self.toggle_maximize)
+
+        self.close_button = QPushButton("✕")
+        self.close_button.setObjectName("closeButton")
+        self.close_button.setFixedSize(30, 30)
+        self.close_button.setToolTip("关闭")
+        self.close_button.clicked.connect(self.close)
+
+        self.title_bar_layout.addWidget(self.minimize_button)
+        self.title_bar_layout.addWidget(self.maximize_button)
+        self.title_bar_layout.addWidget(self.close_button)
+
+        self.central_layout.addWidget(self.title_bar)
 
     def init_top_bar(self):
         top_frame = QFrame()
-        top_frame.setFixedHeight(50)
+        top_frame.setFixedHeight(40) # 减小高度
         top_frame.setStyleSheet("background-color: #181825; border-bottom: 1px solid #313244;")
         layout = QHBoxLayout(top_frame)
         layout.setContentsMargins(10, 5, 10, 5)
@@ -726,20 +890,6 @@ class ClipboardApp(QMainWindow):
         self.sort_map = {0: "manual", 1: "time_desc", 2: "size_desc", 3: "visit_desc", 4: "stars_desc"}
         self.sort_combo.currentIndexChanged.connect(lambda: self.load_data())
         layout.addWidget(self.sort_combo)
-
-        btn_refresh = QPushButton("刷新"); btn_refresh.clicked.connect(lambda: self.load_data())
-        layout.addWidget(btn_refresh)
-        
-        # 自动删除按钮
-        btn_auto_delete = QPushButton("🗑️")
-        btn_auto_delete.clicked.connect(self.auto_delete_old_items)
-        layout.addWidget(btn_auto_delete)
-        
-        # 模式切换按钮
-        self.mode_btn = QPushButton("📖 读取模式")
-        self.mode_btn.setCheckable(True)
-        self.mode_btn.clicked.connect(self.toggle_edit_mode)
-        layout.addWidget(self.mode_btn)
 
         self.central_layout.addWidget(top_frame)
         self.current_filter = None
@@ -1069,11 +1219,13 @@ class ClipboardApp(QMainWindow):
         """切换编辑/读取模式"""
         self.edit_mode = not self.edit_mode
         if self.edit_mode:
-            self.mode_btn.setText("✏️ 编辑模式")
+            self.mode_btn.setText("✏️")
+            self.mode_btn.setToolTip("编辑模式 (已开启)")
             self.table.setEditTriggers(QAbstractItemView.DoubleClicked)
             self.table.setDragEnabled(True)  # 编辑模式允许拖拽
         else:
-            self.mode_btn.setText("📖 读取模式")
+            self.mode_btn.setText("📖")
+            self.mode_btn.setToolTip("读取模式 (已开启)")
             self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
             self.table.setDragEnabled(False)  # 读取模式禁止拖拽
         self.mode_btn.setChecked(self.edit_mode)
@@ -1270,16 +1422,19 @@ class ClipboardApp(QMainWindow):
 
     def set_custom_color(self, item_ids):
         """设置自定义颜色"""
-        from PyQt5.QtWidgets import QColorDialog
-        color = QColorDialog.getColor()
-        if color.isValid():
-            color_hex = color.name()
+        dialog = ColorSelectorDialog(self)
+        if dialog.exec_() == QDialog.Accepted:
+            color_hex = dialog.selected_color
+            
+            # 如果color_hex是空字符串,表示清除颜色,数据库中存为NULL
+            db_color_value = color_hex if color_hex else None
+            
             session = self.db.get_session()
             try:
                 for item_id in item_ids:
                     item = session.query(ClipboardItem).get(item_id)
                     if item:
-                        item.custom_color = color_hex
+                        item.custom_color = db_color_value
                 session.commit()
             finally:
                 session.close()
@@ -1356,6 +1511,17 @@ class ClipboardApp(QMainWindow):
         """窗口关闭时保存状态"""
         self.save_window_state()
         event.accept()
+        
+    def toggle_maximize(self):
+        """切换最大化/正常状态"""
+        if self.isMaximized():
+            self.showNormal()
+            self.maximize_button.setText("⃞")
+            self.maximize_button.setToolTip("最大化")
+        else:
+            self.showMaximized()
+            self.maximize_button.setText("❐")
+            self.maximize_button.setToolTip("向下还原")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
@@ -1363,8 +1529,9 @@ if __name__ == "__main__":
     window.show()
     sys.exit(app.exec_())
 
-# =================== color_selector.py ===================
+# ===================|===================
 
+# color_selector.py
 from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                              QGridLayout, QPushButton, QLineEdit)
 from PyQt5.QtGui import QColor
