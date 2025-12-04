@@ -1840,6 +1840,30 @@ class ClipboardApp(QMainWindow):
         # 4. 延时后模拟粘贴
         from PyQt5.QtCore import QTimer
         QTimer.singleShot(150, self._perform_paste)
+
+    def keyPressEvent(self, event):
+        """处理快捷键设置星级"""
+        modifiers = QApplication.keyboardModifiers()
+        key = event.key()
+
+        # 检查是否按下了Ctrl键
+        if modifiers == Qt.ControlModifier:
+            star_level = -1
+            if Qt.Key_0 <= key <= Qt.Key_5:
+                star_level = key - Qt.Key_0
+
+            if star_level != -1:
+                selected_rows = self.table.selectionModel().selectedRows()
+                if not selected_rows:
+                    return # 没有选中行，不执行任何操作
+
+                item_ids = [int(self.table.item(index.row(), 9).text()) for index in selected_rows]
+                self.batch_set_star(item_ids, star_level)
+                event.accept()
+                return
+
+        # 如果不是我们的快捷键，调用父类的方法
+        super().keyPressEvent(event)
         
     def _perform_paste(self):
         """执行粘贴操作"""
